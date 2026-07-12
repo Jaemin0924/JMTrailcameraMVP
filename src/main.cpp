@@ -1,19 +1,28 @@
+#include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <SD_MMC.h>
 #include <esp_camera.h>
+#include <Wire.h>
+#include <RTClib.h>
 
 // WiFi credentials
-const char* kWiFiSsid = "LognSteam";
-const char* kWiFiPassword = "roboticsisfun!";
+const char* kWiFiSsid = "YOUR_SSID";
+const char* kWiFiPassword = "YOUR_PASSWORD";
 
 // REST endpoint for posting JSON payloads
-const char* kPostUrl = "https://script.google.com/macros/s/AKfycbxoq4EkIb7f6GZVewrn-mSUFbtDmdHMZDknfIcomaxGKW3J3ULM_0GvvbNN824VHbABJA/exec";
+const char* kPostUrl = "https://script.google.com/macros/s/YOUR_SCRIPT_ID/exec";
 
 // Save directory on SD card
 const char* kPhotoDirectory = "/photos";
 
-// Camera pin definitions for ESP32-S3 boards; adjust for your hardware
+// STM32L0 handshake pin - pulled HIGH when this boot's work is done,
+// tells the gatekeeper it's safe to cut power now instead of waiting
+// out the full timeout.
+#define DONE_PIN D0
+
+// Camera pin definitions - VERIFY against your actual board's datasheet
 #define PWDN_GPIO_NUM     -1
 #define RESET_GPIO_NUM    -1
 #define XCLK_GPIO_NUM      8
@@ -26,17 +35,19 @@ const char* kPhotoDirectory = "/photos";
 #define Y5_GPIO_NUM       15
 #define Y4_GPIO_NUM       14
 #define Y3_GPIO_NUM       13
-#define Y2_GPIO_NUM      20
+#define Y2_GPIO_NUM       20
 #define VSYNC_GPIO_NUM    22
 #define HREF_GPIO_NUM     21
 #define PCLK_GPIO_NUM     23
 
-bool hasCapturedPhoto = false;
+RTC_DS3231 rtc;
+bool rtcOk = false;
 
-String base64Encode(const uint8_t* data, size_t length) {
+// Encodes directly into `out` instead of returning a new String - avoids
+// holding two large copies of the same data in memory at once (the
+// returned-String version and whatever it gets appended into).
+void base64EncodeInto(const uint8_t* data, size_t length, String& out) {
   static const char kBase64Alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  String encoded;
-  encoded.reserve(((length + 2) / 3) * 4);
 
   for (size_t i = 0; i < length; i += 3) {
     uint32_t value = 0;
@@ -50,16 +61,26 @@ String base64Encode(const uint8_t* data, size_t length) {
       }
     }
 
-    encoded += kBase64Alphabet[(value >> 18) & 0x3F];
-    encoded += kBase64Alphabet[(value >> 12) & 0x3F];
-    encoded += (bytes > 1) ? kBase64Alphabet[(value >> 6) & 0x3F] : '=';
-    encoded += (bytes > 2) ? kBase64Alphabet[value & 0x3F] : '=';
+    out += kBase64Alphabet[(value >> 18) & 0x3F];
+    out += kBase64Alphabet[(value >> 12) & 0x3F];
+    out += (bytes > 1) ? kBase64Alphabet[(value >> 6) & 0x3F] : '=';
+    out += (bytes > 2) ? kBase64Alphabet[value & 0x3F] : '=';
   }
+}
 
-  return encoded;
+// Fails fast and signals STM32 to cut power immediately instead of
+// spinning until the gatekeeper's hard timeout - matters if a fault
+// (loose connector, etc) becomes a recurring condition in the field.
+void haltAndSleep(const char* reason) {
+  Serial.println(reason);
+  pinMode(DONE_PIN, OUTPUT);
+  digitalWrite(DONE_PIN, HIGH);
+  delay(200);
+  esp_deep_sleep_start();
 }
 
 bool initWiFi() {
+  WiFi.mode(WIFI_STA);
   Serial.printf("Connecting to WiFi '%s'...\n", kWiFiSsid);
   WiFi.begin(kWiFiSsid, kWiFiPassword);
 
@@ -81,7 +102,9 @@ bool initWiFi() {
 
 bool initSDCard() {
   Serial.println("Initializing SD card...");
-  if (!SD_MMC.begin()) {
+  // XIAO Sense's onboard SD slot only routes CLK/CMD/D0 -> 1-bit mode.
+  // If you're on a different board, verify whether it needs 4-bit instead.
+  if (!SD_MMC.begin("/sdcard", true)) {
     Serial.println("SD_MMC.begin() failed");
     return false;
   }
@@ -100,7 +123,7 @@ bool initSDCard() {
 }
 
 bool initCamera() {
-  camera_config_t config;
+  camera_config_t config = {};
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
   config.pin_d0 = Y2_GPIO_NUM;
@@ -132,21 +155,37 @@ bool initCamera() {
     return false;
   }
 
-  sensor_t* s = esp_camera_sensor_get();
-  if (s) {
-    s->set_framesize(s, FRAMESIZE_SVGA);
-  }
-
   Serial.println("Camera initialized successfully");
   return true;
 }
 
-String makePhotoPath() {
-  unsigned long timestamp = millis();
-  return String(kPhotoDirectory) + "/photo_" + String(timestamp) + ".jpg";
+// Sensor needs a couple frames to converge auto-exposure/white-balance.
+// The very first frame after init is frequently black/blown-out/streaked.
+void discardWarmupFrames() {
+  for (int i = 0; i < 2; i++) {
+    camera_fb_t* warm = esp_camera_fb_get();
+    if (warm) esp_camera_fb_return(warm);
+    delay(100);
+  }
 }
 
-bool captureAndSavePhoto() {
+String makePhotoPath() {
+  if (rtcOk) {
+    DateTime now = rtc.now();
+    char buf[48];
+    snprintf(buf, sizeof(buf), "%s/photo_%04d%02d%02d_%02d%02d%02d.jpg",
+             kPhotoDirectory, now.year(), now.month(), now.day(),
+             now.hour(), now.minute(), now.second());
+    return String(buf);
+  }
+  // Fallback if RTC is unreadable: still safer than millis() alone, since
+  // it won't collide across boots the way a boot-relative counter would -
+  // but you lose real date/time. Fix the RTC wiring if you see this path used.
+  uint32_t r = esp_random();
+  return String(kPhotoDirectory) + "/photo_" + String(r) + ".jpg";
+}
+
+bool captureAndSavePhoto(String& outPath) {
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) {
     Serial.println("Camera capture failed");
@@ -171,11 +210,16 @@ bool captureAndSavePhoto() {
     return false;
   }
 
-  Serial.printf("Photo saved to SD: %s (%u bytes)\n", path.c_str(), fb->len);
+  Serial.printf("Photo saved to SD: %s (%u bytes)\n", path.c_str(), written);
+  outPath = path;
   return true;
 }
 
-String findNewPhotoFile() {
+// Finds any leftover un-uploaded photo from a PREVIOUS boot (e.g. one that
+// failed to upload last trigger because WiFi/server was down). Files
+// persist on SD across power cycles, so this is how retry-across-triggers
+// actually works with a power-gated XIAO.
+String findPendingPhoto() {
   File dir = SD_MMC.open(kPhotoDirectory);
   if (!dir || !dir.isDirectory()) {
     if (dir) dir.close();
@@ -189,10 +233,7 @@ String findNewPhotoFile() {
       if (name.endsWith(".jpg") || name.endsWith(".jpeg")) {
         entry.close();
         dir.close();
-        if (name.startsWith("/")) {
-          return name;
-        }
-        return String(kPhotoDirectory) + "/" + name;
+        return name.startsWith("/") ? name : String(kPhotoDirectory) + "/" + name;
       }
     }
     entry.close();
@@ -227,14 +268,31 @@ bool postFileToServer(const String& filePath) {
     return false;
   }
 
-  String payload = "{\"filename\":\"" + filePath + "\",\"image\":\"";
-  payload += base64Encode(buffer, fileSize);
+  // Reserve payload's final size upfront so no reallocation happens
+  // mid-append, and encode straight into it instead of building a
+  // separate ~1.33x-sized temporary String first.
+  size_t base64Len = ((fileSize + 2) / 3) * 4;
+  size_t jsonOverhead = filePath.length() + 32; // quotes, braces, field names
+  String payload;
+  payload.reserve(base64Len + jsonOverhead);
+
+  payload = "{\"filename\":\"" + filePath + "\",\"image\":\"";
+  base64EncodeInto(buffer, fileSize, payload);
   payload += "\"}";
-  delete[] buffer;
+
+  delete[] buffer; // free the raw bytes as soon as we're done with them
+
+  WiFiClientSecure client;
+  client.setInsecure();
 
   HTTPClient http;
-  http.begin(kPostUrl);
+  http.begin(client, kPostUrl);
   http.addHeader("Content-Type", "application/json");
+  http.setTimeout(10000);
+  // Apps Script /exec endpoints 302-redirect to googleusercontent.com -
+  // without this, every POST reads back as a 302 and never registers
+  // as a success, even when the upload actually worked server-side.
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
 
   Serial.printf("Posting %u bytes to %s\n", payload.length(), kPostUrl);
   int httpCode = http.POST(payload);
@@ -253,60 +311,68 @@ bool postFileToServer(const String& filePath) {
     return SD_MMC.remove(filePath.c_str());
   }
 
-  Serial.println("POST failed, keeping file on SD for retry");
+  Serial.println("POST failed, keeping file on SD for retry next trigger");
   return false;
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  delay(200);
+
+  pinMode(DONE_PIN, OUTPUT);
+  digitalWrite(DONE_PIN, LOW);
+
+  Wire.begin();
+  rtcOk = rtc.begin();
+  if (!rtcOk) Serial.println("RTC not found - falling back to random filenames");
 
   if (!initCamera()) {
-    Serial.println("Camera initialization failed. Halting.");
-    while (true) {
-      delay(1000);
-    }
+    haltAndSleep("Camera initialization failed. Signaling done, sleeping.");
+    return;
   }
+  discardWarmupFrames();
 
   if (!initSDCard()) {
-    Serial.println("SD card initialization failed. Halting.");
-    while (true) {
-      delay(1000);
+    haltAndSleep("SD card initialization failed. Signaling done, sleeping.");
+    return;
+  }
+
+  bool wifiOk = initWiFi();
+
+  // 1) Try to flush any photo left over from a prior trigger that
+  //    couldn't upload last time (WiFi/server was down, etc).
+  if (wifiOk) {
+    String pending = findPendingPhoto();
+    if (pending.length() > 0) {
+      Serial.printf("Found pending photo from earlier trigger: %s\n", pending.c_str());
+      postFileToServer(pending);
     }
   }
 
-  if (!initWiFi()) {
-    Serial.println("WiFi not connected. Will continue running and retry on loop.");
+  // 2) Capture this trigger's photo.
+  String newPhotoPath;
+  if (captureAndSavePhoto(newPhotoPath)) {
+    // 3) Best-effort upload of the new photo, once - not an infinite
+    //    retry loop, since holding power open indefinitely defeats the
+    //    point of the gatekeeper architecture. If this fails, it'll be
+    //    picked up as a "pending" file on the NEXT trigger.
+    if (wifiOk) {
+      postFileToServer(newPhotoPath);
+    } else {
+      Serial.println("No WiFi - new photo kept on SD, will retry next trigger");
+    }
   }
 
-  if (captureAndSavePhoto()) {
-    hasCapturedPhoto = true;
-  }
+  SD_MMC.end();
+  esp_camera_deinit();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+
+  digitalWrite(DONE_PIN, HIGH);
+  delay(300);
+  esp_deep_sleep_start();
 }
 
 void loop() {
-  if (!hasCapturedPhoto) {
-    if (captureAndSavePhoto()) {
-      hasCapturedPhoto = true;
-    } else {
-      delay(5000);
-      return;
-    }
-  }
-
-  if (WiFi.status() != WL_CONNECTED) {
-    initWiFi();
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    String photoFile = findNewPhotoFile();
-    if (photoFile.length() > 0) {
-      Serial.printf("Found new photo file: %s\n", photoFile.c_str());
-      if (postFileToServer(photoFile)) {
-        Serial.printf("Deleted %s after successful upload\n", photoFile.c_str());
-      }
-    }
-  }
-
-  delay(10000);
+  // never reached
 }
