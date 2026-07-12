@@ -8,21 +8,25 @@
 #include <RTClib.h>
 
 // WiFi credentials
-const char* kWiFiSsid = "YOUR_SSID";
-const char* kWiFiPassword = "YOUR_PASSWORD";
+const char* kWiFiSsid = "LognSteam";
+const char* kWiFiPassword = "roboticsisfun!";
 
 // REST endpoint for posting JSON payloads
-const char* kPostUrl = "https://script.google.com/macros/s/YOUR_SCRIPT_ID/exec";
+const char* kPostUrl = "https://drive.google.com/drive/folders/10c4ehFUj7CQ_qneVW_DQPeUOt9HWwfQD";
 
 // Save directory on SD card
 const char* kPhotoDirectory = "/photos";
 
-// STM32L0 handshake pin - pulled HIGH when this boot's work is done,
-// tells the gatekeeper it's safe to cut power now instead of waiting
-// out the full timeout.
+// STM32L0 handshake pin - pulled HIGH when this boot's work is done.
+// This tells the gatekeeper it is safe to cut power now instead of
+// waiting out the full timeout.
+#if defined(D0)
 #define DONE_PIN D0
+#else
+#define DONE_PIN 0
+#endif
 
-// Camera pin definitions - VERIFY against your actual board's datasheet
+// Camera pin definitions - verify against your actual board datasheet.
 #define PWDN_GPIO_NUM     -1
 #define RESET_GPIO_NUM    -1
 #define XCLK_GPIO_NUM      8
@@ -43,11 +47,10 @@ const char* kPhotoDirectory = "/photos";
 RTC_DS3231 rtc;
 bool rtcOk = false;
 
-// Encodes directly into `out` instead of returning a new String - avoids
-// holding two large copies of the same data in memory at once (the
-// returned-String version and whatever it gets appended into).
-void base64EncodeInto(const uint8_t* data, size_t length, String& out) {
+String base64Encode(const uint8_t* data, size_t length) {
   static const char kBase64Alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  String encoded;
+  encoded.reserve(((length + 2) / 3) * 4);
 
   for (size_t i = 0; i < length; i += 3) {
     uint32_t value = 0;
@@ -61,16 +64,15 @@ void base64EncodeInto(const uint8_t* data, size_t length, String& out) {
       }
     }
 
-    out += kBase64Alphabet[(value >> 18) & 0x3F];
-    out += kBase64Alphabet[(value >> 12) & 0x3F];
-    out += (bytes > 1) ? kBase64Alphabet[(value >> 6) & 0x3F] : '=';
-    out += (bytes > 2) ? kBase64Alphabet[value & 0x3F] : '=';
+    encoded += kBase64Alphabet[(value >> 18) & 0x3F];
+    encoded += kBase64Alphabet[(value >> 12) & 0x3F];
+    encoded += (bytes > 1) ? kBase64Alphabet[(value >> 6) & 0x3F] : '=';
+    encoded += (bytes > 2) ? kBase64Alphabet[value & 0x3F] : '=';
   }
+
+  return encoded;
 }
 
-// Fails fast and signals STM32 to cut power immediately instead of
-// spinning until the gatekeeper's hard timeout - matters if a fault
-// (loose connector, etc) becomes a recurring condition in the field.
 void haltAndSleep(const char* reason) {
   Serial.println(reason);
   pinMode(DONE_PIN, OUTPUT);
@@ -102,8 +104,6 @@ bool initWiFi() {
 
 bool initSDCard() {
   Serial.println("Initializing SD card...");
-  // XIAO Sense's onboard SD slot only routes CLK/CMD/D0 -> 1-bit mode.
-  // If you're on a different board, verify whether it needs 4-bit instead.
   if (!SD_MMC.begin("/sdcard", true)) {
     Serial.println("SD_MMC.begin() failed");
     return false;
@@ -159,8 +159,6 @@ bool initCamera() {
   return true;
 }
 
-// Sensor needs a couple frames to converge auto-exposure/white-balance.
-// The very first frame after init is frequently black/blown-out/streaked.
 void discardWarmupFrames() {
   for (int i = 0; i < 2; i++) {
     camera_fb_t* warm = esp_camera_fb_get();
@@ -178,9 +176,7 @@ String makePhotoPath() {
              now.hour(), now.minute(), now.second());
     return String(buf);
   }
-  // Fallback if RTC is unreadable: still safer than millis() alone, since
-  // it won't collide across boots the way a boot-relative counter would -
-  // but you lose real date/time. Fix the RTC wiring if you see this path used.
+
   uint32_t r = esp_random();
   return String(kPhotoDirectory) + "/photo_" + String(r) + ".jpg";
 }
@@ -215,10 +211,6 @@ bool captureAndSavePhoto(String& outPath) {
   return true;
 }
 
-// Finds any leftover un-uploaded photo from a PREVIOUS boot (e.g. one that
-// failed to upload last trigger because WiFi/server was down). Files
-// persist on SD across power cycles, so this is how retry-across-triggers
-// actually works with a power-gated XIAO.
 String findPendingPhoto() {
   File dir = SD_MMC.open(kPhotoDirectory);
   if (!dir || !dir.isDirectory()) {
@@ -268,19 +260,10 @@ bool postFileToServer(const String& filePath) {
     return false;
   }
 
-  // Reserve payload's final size upfront so no reallocation happens
-  // mid-append, and encode straight into it instead of building a
-  // separate ~1.33x-sized temporary String first.
-  size_t base64Len = ((fileSize + 2) / 3) * 4;
-  size_t jsonOverhead = filePath.length() + 32; // quotes, braces, field names
-  String payload;
-  payload.reserve(base64Len + jsonOverhead);
-
-  payload = "{\"filename\":\"" + filePath + "\",\"image\":\"";
-  base64EncodeInto(buffer, fileSize, payload);
+  String payload = "{\"filename\":\"" + filePath + "\",\"image\":\"";
+  payload += base64Encode(buffer, fileSize);
   payload += "\"}";
-
-  delete[] buffer; // free the raw bytes as soon as we're done with them
+  delete[] buffer;
 
   WiFiClientSecure client;
   client.setInsecure();
@@ -289,9 +272,6 @@ bool postFileToServer(const String& filePath) {
   http.begin(client, kPostUrl);
   http.addHeader("Content-Type", "application/json");
   http.setTimeout(10000);
-  // Apps Script /exec endpoints 302-redirect to googleusercontent.com -
-  // without this, every POST reads back as a 302 and never registers
-  // as a success, even when the upload actually worked server-side.
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
 
   Serial.printf("Posting %u bytes to %s\n", payload.length(), kPostUrl);
@@ -324,7 +304,9 @@ void setup() {
 
   Wire.begin();
   rtcOk = rtc.begin();
-  if (!rtcOk) Serial.println("RTC not found - falling back to random filenames");
+  if (!rtcOk) {
+    Serial.println("RTC not found - falling back to random filenames");
+  }
 
   if (!initCamera()) {
     haltAndSleep("Camera initialization failed. Signaling done, sleeping.");
@@ -339,8 +321,6 @@ void setup() {
 
   bool wifiOk = initWiFi();
 
-  // 1) Try to flush any photo left over from a prior trigger that
-  //    couldn't upload last time (WiFi/server was down, etc).
   if (wifiOk) {
     String pending = findPendingPhoto();
     if (pending.length() > 0) {
@@ -349,13 +329,8 @@ void setup() {
     }
   }
 
-  // 2) Capture this trigger's photo.
   String newPhotoPath;
   if (captureAndSavePhoto(newPhotoPath)) {
-    // 3) Best-effort upload of the new photo, once - not an infinite
-    //    retry loop, since holding power open indefinitely defeats the
-    //    point of the gatekeeper architecture. If this fails, it'll be
-    //    picked up as a "pending" file on the NEXT trigger.
     if (wifiOk) {
       postFileToServer(newPhotoPath);
     } else {
